@@ -1,0 +1,6 @@
+#!/bin/sh
+if [ "$#" -ne 0 ]; then
+    printf '%s\n' 'Usage: hunter-fans' >&2
+    exit 2
+fi
+exec cat /sys/bus/platform/devices/huawei-wmi/hunter/fans

@@ -1,0 +1,13 @@
+__pycache__/
+build/
+kernel/*.o
+kernel/*.ko
+kernel/*.mod
+kernel/*.mod.c
+kernel/.*.cmd
+kernel/Module.symvers
+kernel/modules.order
+kernel/.tmp_versions/
+kernel/source-manifest.json
+archive/
+evidence/
