@@ -51,13 +51,13 @@ $ hunter light keyboard 2 1 FF0000,00FF00,0000FF
 
 ## sysfs 接口
 
-位于 `/sys/bus/platform/devices/huawei-wmi/`：
+位于 `/sys/bus/platform/devices/huawei-wmi/`。内核不允许驱动创建所有用户可写的节点，普通用户写灯光节点需由下游（如 udev 规则）放宽权限。
 
 | 节点 | 权限 | 内容 |
 |---|---|---|
 | `hunter/mode` | 0444 | 每次读取都向固件查询 |
 | `hunter/fans` | 0444 | 同上 |
-| `hunter_light/{logo,keyboard,wind}` | 0222 | 写入 `off` 或 `EFFECT SPEED RRGGBB[,RRGGBB...]` |
+| `hunter_light/{logo,keyboard,wind}` | 0200 | 写入 `off` 或 `EFFECT SPEED RRGGBB[,RRGGBB...]` |
 
 ## 许可证
 

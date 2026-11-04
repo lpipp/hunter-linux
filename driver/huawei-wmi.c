@@ -776,17 +776,13 @@ static ssize_t hunter_light_store(unsigned int zone, const char *buf, size_t cou
 	return err ?: count;
 }
 
-/* The light nodes are world writable on purpose, which __ATTR_WO forbids. */
 #define HUNTER_LIGHT_ATTR(_name, _zone)						\
 static ssize_t _name##_store(struct device *dev,				\
 		struct device_attribute *attr, const char *buf, size_t count)	\
 {										\
 	return hunter_light_store(_zone, buf, count);				\
 }										\
-static struct device_attribute dev_attr_##_name = {				\
-	.attr = { .name = #_name, .mode = 0222 },				\
-	.store = _name##_store,							\
-}
+static DEVICE_ATTR_WO(_name)
 
 HUNTER_LIGHT_ATTR(logo, HUNTER_LOGO);
 HUNTER_LIGHT_ATTR(keyboard, HUNTER_KEYBOARD);
