@@ -19,6 +19,7 @@
 #include <linux/sysfs.h>
 #include <linux/wmi.h>
 #include <acpi/battery.h>
+#include "hunter.h"
 
 /*
  * Huawei WMI GUIDs
@@ -148,111 +149,73 @@ static const struct dmi_system_id huawei_quirks[] = {
 
 /* Utils */
 
-static int huawei_wmi_call(struct huawei_wmi *huawei,
-			   struct acpi_buffer *in, struct acpi_buffer *out)
-{
-	acpi_status status;
-
-	mutex_lock(&huawei->wmi_lock);
-	status = wmi_evaluate_method(HWMI_METHOD_GUID, 0, 1, in, out);
-	mutex_unlock(&huawei->wmi_lock);
-	if (ACPI_FAILURE(status)) {
-		dev_err(huawei->dev, "Failed to evaluate wmi method\n");
-		return -ENODEV;
-	}
-
-	return 0;
-}
-
-/* HWMI takes a 64 bit input and returns either a package with 2 buffers, one of
- * 4 bytes and the other of 256 bytes, or one buffer of size 0x104 (260) bytes.
- * The first 4 bytes are ignored, we ignore the first 4 bytes buffer if we got a
- * package, or skip the first 4 if a buffer of 0x104 is used. The first byte of
- * the remaining 0x100 sized buffer has the return status of every call. In case
- * the return status is non-zero, we return -ENODEV but still copy the returned
- * buffer to the given buffer parameter (buf).
+/* HWMI takes an input buffer (a 64 bit command, or 64 bytes for Hunter) and
+ * returns either a package with 2 buffers, one of 4 bytes and the other of 256
+ * bytes, or one buffer of size 0x104 (260) bytes. The first 4 bytes are ignored.
+ * The first byte of the remaining 0x100 sized buffer has the return status of
+ * every call. In case the return status is non-zero, we return -ENODEV but still
+ * copy the returned buffer to the given buffer parameter (buf).
+ *
+ * Some models require calling HWMI twice to execute a command. We evaluate
+ * HWMI and if we get a non-zero return status we evaluate it again.
+ *
+ * The caller holds wmi_lock.
  */
-static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
+static int huawei_wmi_call(struct huawei_wmi *huawei, void *arg, size_t arglen,
+			   u8 *buf, size_t buflen)
 {
-	struct huawei_wmi *huawei = huawei_wmi;
-	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
-	struct acpi_buffer in;
+	struct acpi_buffer in = { arglen, arg };
 	union acpi_object *obj;
-	size_t len;
-	int err, i;
+	u8 *data;
+	int err = 0, i;
 
-	in.length = sizeof(arg);
-	in.pointer = &arg;
+	lockdep_assert_held(&huawei->wmi_lock);
 
-	/* Some models require calling HWMI twice to execute a command. We evaluate
-	 * HWMI and if we get a non-zero return status we evaluate it again.
-	 */
 	for (i = 0; i < 2; i++) {
-		err = huawei_wmi_call(huawei, &in, &out);
-		if (err)
-			goto fail_cmd;
+		struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
 
-		obj = out.pointer;
-		if (!obj) {
-			err = -EIO;
-			goto fail_cmd;
+		if (ACPI_FAILURE(wmi_evaluate_method(HWMI_METHOD_GUID, 0, 1, &in, &out))) {
+			dev_err(huawei->dev, "Failed to evaluate wmi method\n");
+			return -ENODEV;
 		}
 
-		switch (obj->type) {
+		obj = out.pointer;
+		data = NULL;
 		/* Models that implement both "legacy" and HWMI tend to return a 0x104
 		 * sized buffer instead of a package of 0x4 and 0x100 buffers.
 		 */
-		case ACPI_TYPE_BUFFER:
-			if (obj->buffer.length == 0x104) {
-				// Skip the first 4 bytes.
-				obj->buffer.pointer += 4;
-				len = 0x100;
-			} else {
-				dev_err(huawei->dev, "Bad buffer length, got %d\n", obj->buffer.length);
-				err = -EIO;
-				goto fail_cmd;
-			}
+		if (obj && obj->type == ACPI_TYPE_BUFFER && obj->buffer.length == 0x104)
+			data = obj->buffer.pointer + 4;
+		else if (obj && obj->type == ACPI_TYPE_PACKAGE && obj->package.count == 2 &&
+			 obj->package.elements[1].type == ACPI_TYPE_BUFFER &&
+			 obj->package.elements[1].buffer.length == 0x100)
+			data = obj->package.elements[1].buffer.pointer;
 
-			break;
-		/* HWMI returns a package with 2 buffer elements, one of 4 bytes and the
-		 * other is 256 bytes.
-		 */
-		case ACPI_TYPE_PACKAGE:
-			if (obj->package.count != 2) {
-				dev_err(huawei->dev, "Bad package count, got %d\n", obj->package.count);
-				err = -EIO;
-				goto fail_cmd;
-			}
-
-			obj = &obj->package.elements[1];
-			if (obj->type != ACPI_TYPE_BUFFER) {
-				dev_err(huawei->dev, "Bad package element type, got %d\n", obj->type);
-				err = -EIO;
-				goto fail_cmd;
-			}
-			len = obj->buffer.length;
-
-			break;
-		/* Shouldn't get here! */
-		default:
-			dev_err(huawei->dev, "Unexpected obj type, got: %d\n", obj->type);
-			err = -EIO;
-			goto fail_cmd;
+		if (!data) {
+			dev_err(huawei->dev, "Unexpected wmi response\n");
+			kfree(obj);
+			return -EIO;
 		}
 
-		if (!*obj->buffer.pointer)
+		err = data[0] ? -ENODEV : 0;
+		if (buf)
+			memcpy(buf, data, min_t(size_t, buflen, 0x100));
+		kfree(obj);
+		if (!err)
 			break;
 	}
 
-	err = (*obj->buffer.pointer) ? -ENODEV : 0;
+	return err;
+}
 
-	if (buf) {
-		len = min(buflen, len);
-		memcpy(buf, obj->buffer.pointer, len);
-	}
+static int huawei_wmi_cmd(u64 arg, u8 *buf, size_t buflen)
+{
+	int err;
 
-fail_cmd:
-	kfree(out.pointer);
+	mutex_lock(&huawei_wmi->wmi_lock);
+	err = huawei_wmi_call(huawei_wmi, &arg, sizeof(arg), buf, buflen);
+	mutex_unlock(&huawei_wmi->wmi_lock);
+
 	return err;
 }
 
@@ -611,69 +574,18 @@ static void huawei_wmi_fn_lock_exit(struct device *dev)
 
 /* debugfs */
 
-static void huawei_wmi_debugfs_call_dump(struct seq_file *m, void *data,
-		union acpi_object *obj)
-{
-	struct huawei_wmi *huawei = m->private;
-	int i;
-
-	switch (obj->type) {
-	case ACPI_TYPE_INTEGER:
-		seq_printf(m, "0x%llx", obj->integer.value);
-		break;
-	case ACPI_TYPE_STRING:
-		seq_printf(m, "\"%.*s\"", obj->string.length, obj->string.pointer);
-		break;
-	case ACPI_TYPE_BUFFER:
-		seq_puts(m, "{");
-		for (i = 0; i < obj->buffer.length; i++) {
-			seq_printf(m, "0x%02x", obj->buffer.pointer[i]);
-			if (i < obj->buffer.length - 1)
-				seq_puts(m, ",");
-		}
-		seq_puts(m, "}");
-		break;
-	case ACPI_TYPE_PACKAGE:
-		seq_puts(m, "[");
-		for (i = 0; i < obj->package.count; i++) {
-			huawei_wmi_debugfs_call_dump(m, huawei, &obj->package.elements[i]);
-			if (i < obj->package.count - 1)
-				seq_puts(m, ",");
-		}
-		seq_puts(m, "]");
-		break;
-	default:
-		dev_err(huawei->dev, "Unexpected obj type, got %d\n", obj->type);
-		return;
-	}
-}
-
 static int huawei_wmi_debugfs_call_show(struct seq_file *m, void *data)
 {
 	struct huawei_wmi *huawei = m->private;
-	struct acpi_buffer out = { ACPI_ALLOCATE_BUFFER, NULL };
-	struct acpi_buffer in;
-	union acpi_object *obj;
+	u8 buf[0x100];
 	int err;
 
-	in.length = sizeof(u64);
-	in.pointer = &huawei->debug.arg;
-
-	err = huawei_wmi_call(huawei, &in, &out);
+	err = huawei_wmi_cmd(huawei->debug.arg, buf, sizeof(buf));
 	if (err)
 		return err;
 
-	obj = out.pointer;
-	if (!obj) {
-		err = -EIO;
-		goto fail_debugfs_call;
-	}
-
-	huawei_wmi_debugfs_call_dump(m, huawei, obj);
-
-fail_debugfs_call:
-	kfree(out.pointer);
-	return err;
+	seq_hex_dump(m, "", DUMP_PREFIX_NONE, 16, 1, buf, sizeof(buf), false);
+	return 0;
 }
 
 DEFINE_SHOW_ATTRIBUTE(huawei_wmi_debugfs_call);
@@ -783,6 +695,121 @@ static void huawei_wmi_input_exit(struct device *dev, const char *guid)
 	wmi_remove_notify_handler(guid);
 }
 
+/* HONOR Hunter */
+
+static int hunter_query(u8 cmd, u8 arg, u8 *buf)
+{
+	u8 in[64] = { cmd == 0x12 ? 4 : 2, cmd, arg };
+	int err;
+
+	mutex_lock(&huawei_wmi->wmi_lock);
+	err = huawei_wmi_call(huawei_wmi, in, sizeof(in), buf, 0x100);
+	mutex_unlock(&huawei_wmi->wmi_lock);
+
+	return err;
+}
+
+static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	u8 ret[0x100];
+	int err;
+
+	err = hunter_query(0x12, 0, ret);
+	if (err)
+		return err;
+	if (ret[1] > 2)
+		return -EPROTO;
+
+	return sysfs_emit(buf, "%u\n", ret[1]);
+}
+
+static ssize_t fans_show(struct device *dev, struct device_attribute *attr,
+		char *buf)
+{
+	u8 ret[0x100];
+	unsigned int rpm[2];
+	int err, i;
+
+	for (i = 0; i < 2; i++) {
+		err = hunter_query(0x08, i, ret);
+		if (err)
+			return err;
+		rpm[i] = ret[1] | ret[2] << 8;
+	}
+
+	return sysfs_emit(buf, "%u %u\n", rpm[0], rpm[1]);
+}
+
+static DEVICE_ATTR_RO(mode);
+static DEVICE_ATTR_RO(fans);
+
+static struct attribute *hunter_attrs[] = {
+	&dev_attr_mode.attr,
+	&dev_attr_fans.attr,
+	NULL
+};
+
+static const struct attribute_group hunter_group = {
+	.name = "hunter",
+	.attrs = hunter_attrs,
+};
+
+static ssize_t hunter_light_store(unsigned int zone, const char *buf, size_t count)
+{
+	struct hunter_light light;
+	u8 in[64];
+	unsigned int i;
+	int err;
+
+	err = hunter_light_parse(zone, buf, count, &light);
+	if (err)
+		return err;
+
+	mutex_lock(&huawei_wmi->wmi_lock);
+	for (i = 0; i < hunter_light_packets(zone, &light) && !err; i++) {
+		hunter_light_encode(zone, &light, i, in);
+		err = huawei_wmi_call(huawei_wmi, in, sizeof(in), NULL, 0);
+	}
+	mutex_unlock(&huawei_wmi->wmi_lock);
+
+	return err ?: count;
+}
+
+/* The light nodes are world writable on purpose, which __ATTR_WO forbids. */
+#define HUNTER_LIGHT_ATTR(_name, _zone)						\
+static ssize_t _name##_store(struct device *dev,				\
+		struct device_attribute *attr, const char *buf, size_t count)	\
+{										\
+	return hunter_light_store(_zone, buf, count);				\
+}										\
+static struct device_attribute dev_attr_##_name = {				\
+	.attr = { .name = #_name, .mode = 0222 },				\
+	.store = _name##_store,							\
+}
+
+HUNTER_LIGHT_ATTR(logo, HUNTER_LOGO);
+HUNTER_LIGHT_ATTR(keyboard, HUNTER_KEYBOARD);
+HUNTER_LIGHT_ATTR(wind, HUNTER_WIND);
+
+static struct attribute *hunter_light_attrs[] = {
+	&dev_attr_logo.attr,
+	&dev_attr_keyboard.attr,
+	&dev_attr_wind.attr,
+	NULL
+};
+
+static const struct attribute_group hunter_light_group = {
+	.name = "hunter_light",
+	.attrs = hunter_light_attrs,
+};
+
+static const struct attribute_group *hunter_groups[] = {
+	&hunter_group,
+	&hunter_light_group,
+	NULL
+};
+
 /* Huawei driver */
 
 static const struct wmi_device_id huawei_wmi_events_id_table[] = {
@@ -798,6 +825,7 @@ static int huawei_wmi_probe(struct platform_device *pdev)
 
 	platform_set_drvdata(pdev, huawei_wmi);
 	huawei_wmi->dev = &pdev->dev;
+	mutex_init(&huawei_wmi->wmi_lock);
 
 	while (*guid->guid_string) {
 		if (wmi_has_guid(guid->guid_string)) {
@@ -812,8 +840,6 @@ static int huawei_wmi_probe(struct platform_device *pdev)
 	}
 
 	if (wmi_has_guid(HWMI_METHOD_GUID)) {
-		mutex_init(&huawei_wmi->wmi_lock);
-
 		huawei_wmi_leds_setup(&pdev->dev);
 		huawei_wmi_fn_lock_setup(&pdev->dev);
 		huawei_wmi_battery_setup(&pdev->dev);
@@ -844,6 +870,7 @@ static void huawei_wmi_remove(struct platform_device *pdev)
 static struct platform_driver huawei_wmi_driver = {
 	.driver = {
 		.name = "huawei-wmi",
+		.dev_groups = hunter_groups,
 	},
 	.probe = huawei_wmi_probe,
 	.remove = huawei_wmi_remove,
@@ -854,7 +881,7 @@ static __init int huawei_wmi_init(void)
 	struct platform_device *pdev;
 	int err;
 
-	huawei_wmi = kzalloc_obj(struct huawei_wmi);
+	huawei_wmi = kzalloc(sizeof(*huawei_wmi), GFP_KERNEL);
 	if (!huawei_wmi)
 		return -ENOMEM;
 
