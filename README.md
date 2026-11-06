@@ -62,20 +62,41 @@ $ hunter light keyboard 2 1 FF0000,00FF00,0000FF
 
 ## Waybar
 
+`hunter watch` 常驻查询，把结果原子地写进一个 JSON 文件：
+
 ```sh
-mkdir -p ~/.cache/hunter
 hunter watch -n 2 -o ~/.cache/hunter/status.json
 ```
-
-文件每次都整体替换，不会读到半份内容：
 
 ```json
 {"mode":1,"mode_name":"performance","fan1":1570,"fan2":1590,"stale":false}
 ```
 
-`mode` 为 -1 表示还没查到过模式；`fan1`、`fan2` 同理为 -1。查询失败时保留上一次的数值，只把 `stale` 置为 `true`。
+`mode` 为 -1 表示还没查到过；`fan1`、`fan2` 同理。查询失败时保留上一次的数值，只把 `stale` 置为 `true`。
 
-Waybar 每个模块都会执行一次命令，建议用一个只读该文件的公共模块，再在其他模块里 `"format": "{custom/hunter}"` 复用。
+### 事件驱动刷新
+
+默认每 `-n` 秒重查一次。加上 `-s` 和 `-S` 后，内容变化时会给名字匹配的进程发 `SIGRTMIN+N`，让 Waybar 立刻重读，而不是自己轮询：
+
+```sh
+hunter watch -n 2 -o ~/.cache/hunter/status.json -s waybar -S 8
+```
+
+Waybar 配置里给同一个模块加 `"signal": 8` 并去掉 `"interval"`：
+
+```jsonc
+"custom/hunter": {
+  "exec": "cat ~/.cache/hunter/status.json",
+  "return-type": "json",
+  "signal": 8,
+  "format": "⚡ {fan1}/{fan2}",
+  "tooltip-format": "模式：{mode_name}"
+}
+```
+
+想强制立刻刷新一次，给 `watch` 发 `SIGHUP`：`pkill -HUP -x hunter`，或 `systemctl --user kill -s HUP hunter`。
+
+内容只在变化时触发信号，所以风扇读数稳定时 Waybar 不会被无谓唤醒。
 
 ## 许可证
 
