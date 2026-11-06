@@ -32,6 +32,7 @@ $ hunter light keyboard 2 1 FF0000,00FF00,0000FF
 - `fans`：fan1、fan2 转速（RPM）。
 - `light ZONE on|off|RRGGBB`：开（默认蓝色 `00AAFF`）、关、单色常亮。
 - `light ZONE EFFECT SPEED PALETTE`：灯效编号、速度和逗号分隔的颜色组。
+- `watch -o FILE [-n SECONDS]`：常驻，每 `SECONDS`（默认 2）秒重写一次 FILE，供 Waybar 等工具读取，见下文。
 
 | 灯区 | 灯效 | 颜色数 |
 |---|---|---|
@@ -58,6 +59,23 @@ $ hunter light keyboard 2 1 FF0000,00FF00,0000FF
 | `hunter/mode` | 0444 | 每次读取都向固件查询 |
 | `hunter/fans` | 0444 | 同上 |
 | `hunter_light/{logo,keyboard,wind}` | 0200 | 写入 `off` 或 `EFFECT SPEED RRGGBB[,RRGGBB...]` |
+
+## Waybar
+
+```sh
+mkdir -p ~/.cache/hunter
+hunter watch -n 2 -o ~/.cache/hunter/status.json
+```
+
+文件每次都整体替换，不会读到半份内容：
+
+```json
+{"mode":1,"mode_name":"performance","fan1":1570,"fan2":1590,"stale":false}
+```
+
+`mode` 为 -1 表示还没查到过模式；`fan1`、`fan2` 同理为 -1。查询失败时保留上一次的数值，只把 `stale` 置为 `true`。
+
+Waybar 每个模块都会执行一次命令，建议用一个只读该文件的公共模块，再在其他模块里 `"format": "{custom/hunter}"` 复用。
 
 ## 许可证
 
